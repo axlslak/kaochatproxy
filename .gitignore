@@ -1,0 +1,4 @@
+/.build/
+/kworker
+/kworker-plugins/
+/kworker.conf

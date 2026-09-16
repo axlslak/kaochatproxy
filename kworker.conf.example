@@ -1,0 +1,12 @@
+# Copy to kworker.conf, fill in the credentials, then chmod 600 kworker.conf.
+# Repeat this section once for each worker AO account (maximum 32).
+
+[worker]
+username=first-account
+password=first-password
+character=Firstworker
+
+[worker]
+username=second-account
+password=second-password
+character=Secondworker
