@@ -17,8 +17,8 @@ volatile sig_atomic_t kw_stop_requested;
 volatile sig_atomic_t kw_reload_requested;
 
 /* Start connection attempts in small batches without blocking the AO loop. */
-#define KW_LOGIN_BATCH_SIZE 10u
-#define KW_LOGIN_BATCH_INTERVAL_SECONDS 1
+#define KW_LOGIN_BATCH_SIZE 5u
+#define KW_LOGIN_BATCH_INTERVAL_SECONDS 2
 
 enum login_stage { WAIT_SEED, WAIT_CHARLIST, WAIT_LOGIN_OK, ONLINE };
 
