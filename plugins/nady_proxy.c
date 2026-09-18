@@ -35,10 +35,43 @@
 #define AO_PING 100u
 #define BUDDY_ROUTE_LIMIT (1000u * (KW_MAX_WORKERS + 1u))
 
+/* Proxy-local connection membership: slot zero is the client upstream;
+ * worker indices remain independent of it. */
+#define MEMBERSHIP_WORDS ((KW_MAX_WORKERS + 1u + 63u) / 64u)
+struct connection_memberships {
+    uint64_t words[MEMBERSHIP_WORDS];
+};
+
+static int membership_has(const struct connection_memberships *set, int destination)
+{
+    size_t slot = (size_t)(destination + 1);
+    return !!(set->words[slot / 64u] & (UINT64_C(1) << (slot % 64u)));
+}
+
+static void membership_set(struct connection_memberships *set, int destination)
+{
+    size_t slot = (size_t)(destination + 1);
+    set->words[slot / 64u] |= UINT64_C(1) << (slot % 64u);
+}
+
+static void membership_clear(struct connection_memberships *set, int destination)
+{
+    size_t slot = (size_t)(destination + 1);
+    set->words[slot / 64u] &= ~(UINT64_C(1) << (slot % 64u));
+}
+
+static int membership_any(const struct connection_memberships *set)
+{
+    for (size_t i = 0; i < MEMBERSHIP_WORDS; ++i)
+        if (set->words[i])
+            return 1;
+    return 0;
+}
+
 struct buddy_route {
     uint32_t uid;
     int destination;
-    uint64_t memberships;
+    struct connection_memberships memberships;
 };
 
 struct frame_node {
@@ -375,8 +408,9 @@ static int is_capabilities(const unsigned char *text, size_t length)
 
 static int answer_capabilities(void)
 {
-    char json[2048];
-    unsigned char body[2100];
+    /* Configured character names are at most 15 bytes; allow ample JSON overhead. */
+    char json[512u + 32u * KW_MAX_WORKERS];
+    unsigned char body[sizeof(json) + 2u];
     size_t json_len = 0, frame_len;
     unsigned char *frame;
     int length = snprintf(json, sizeof(json),
@@ -492,7 +526,7 @@ static int least_loaded_destination(void)
 
 static void log_buddy_allocation(size_t total)
 {
-    char message[768];
+    char message[64u + 48u * KW_MAX_WORKERS];
     size_t position;
     pthread_mutex_lock(&state_lock);
     int length = snprintf(message, sizeof(message),
@@ -532,11 +566,6 @@ static int reserve_route(void)
     return 1;
 }
 
-static uint64_t destination_bit(int destination)
-{
-    return UINT64_C(1) << (destination + 1);
-}
-
 static void change_count(int destination, int add)
 {
     size_t *count = destination < 0 ? &main_buddy_count :
@@ -551,7 +580,8 @@ static void change_count(int destination, int add)
  * Keep duplicate memberships: they occupy a slot on EACH connection. */
 static void observe_buddy(uint32_t uid, int destination, int removed)
 {
-    uint64_t bit = destination_bit(destination);
+    if (destination < -1 || destination >= (int)host->worker_count(host->context))
+        return;
     pthread_mutex_lock(&state_lock);
     size_t i;
     for (i = 0; i < buddy_route_count; ++i)
@@ -567,21 +597,21 @@ static void observe_buddy(uint32_t uid, int destination, int removed)
             pthread_mutex_unlock(&state_lock);
             return;
         }
-        buddy_routes[i] = (struct buddy_route){ uid, destination, 0 };
+        buddy_routes[i] = (struct buddy_route){ .uid = uid, .destination = destination };
         buddy_route_count++;
     }
     struct buddy_route *route = &buddy_routes[i];
-    if (!removed && !(route->memberships & bit)) {
-        route->memberships |= bit;
+    if (!removed && !membership_has(&route->memberships, destination)) {
+        membership_set(&route->memberships, destination);
         change_count(destination, 1);
-    } else if (removed && (route->memberships & bit)) {
-        route->memberships &= ~bit;
+    } else if (removed && membership_has(&route->memberships, destination)) {
+        membership_clear(&route->memberships, destination);
         change_count(destination, 0);
-        if (!route->memberships) {
+        if (!membership_any(&route->memberships)) {
             buddy_routes[i] = buddy_routes[--buddy_route_count];
         } else if (route->destination == destination) {
             for (int d = -1; d < (int)host->worker_count(host->context); ++d)
-                if (route->memberships & destination_bit(d)) {
+                if (membership_has(&route->memberships, d)) {
                     route->destination = d;
                     break;
                 }
@@ -610,7 +640,7 @@ static int assign_buddy_route(uint32_t uid, int requested_destination,
     }
     *destination = has_forced_destination ?
         requested_destination : least_loaded_destination();
-    if (*destination < -1 ||
+    if (*destination < -1 || *destination >= (int)host->worker_count(host->context) ||
         (*destination < 0 ? main_buddy_count : worker_buddy_count[*destination]) >= 1000) {
         pthread_mutex_unlock(&state_lock);
         host->log(host->context, KW_LOG_ERROR, "nady_proxy",
@@ -619,7 +649,9 @@ static int assign_buddy_route(uint32_t uid, int requested_destination,
     }
     buddy_routes[buddy_route_count].uid = uid;
     buddy_routes[buddy_route_count].destination = *destination;
-    buddy_routes[buddy_route_count].memberships = destination_bit(*destination);
+    memset(&buddy_routes[buddy_route_count].memberships, 0,
+           sizeof(buddy_routes[buddy_route_count].memberships));
+    membership_set(&buddy_routes[buddy_route_count].memberships, *destination);
     buddy_route_count++;
     if (*destination >= 0)
         worker_buddy_count[*destination]++;
@@ -640,7 +672,7 @@ static int take_buddy_route(uint32_t uid, int *destination)
             continue;
         *destination = buddy_routes[i].destination;
         for (int d = -1; d < (int)host->worker_count(host->context); ++d)
-            if (buddy_routes[i].memberships & destination_bit(d))
+            if (membership_has(&buddy_routes[i].memberships, d))
                 change_count(d, 0);
         buddy_routes[i] = buddy_routes[buddy_route_count - 1];
         buddy_route_count--;
@@ -785,7 +817,7 @@ static int handle_client_frame(const unsigned char *frame, size_t frame_len, int
         if (body_len != 4)
             return 0;
         uid = get_u32(body);
-        uint64_t memberships = 0;
+        struct connection_memberships memberships = { { 0 } };
         pthread_mutex_lock(&state_lock);
         for (size_t i = 0; i < buddy_route_count; ++i)
             if (buddy_routes[i].uid == uid) {
@@ -803,9 +835,9 @@ static int handle_client_frame(const unsigned char *frame, size_t frame_len, int
         }
         int ok = 1;
         for (size_t i = 0; i < host->worker_count(host->context); ++i)
-            if ((memberships & destination_bit((int)i)) && !submit_buddy(i, uid, 1))
+            if (membership_has(&memberships, (int)i) && !submit_buddy(i, uid, 1))
                 ok = 0;
-        if ((memberships & destination_bit(-1)) && !send_all(upstream, frame, frame_len))
+        if (membership_has(&memberships, -1) && !send_all(upstream, frame, frame_len))
             ok = 0;
         return ok;
     }
@@ -983,14 +1015,14 @@ static void forget_leader_buddies(void)
     pthread_mutex_lock(&state_lock);
     for (size_t i = 0; i < buddy_route_count;) {
         struct buddy_route *route = &buddy_routes[i];
-        route->memberships &= ~destination_bit(-1);
-        if (!route->memberships) {
+        membership_clear(&route->memberships, -1);
+        if (!membership_any(&route->memberships)) {
             buddy_routes[i] = buddy_routes[--buddy_route_count];
             continue;
         }
         if (route->destination == -1)
             for (size_t d = 0; d < host->worker_count(host->context); ++d)
-                if (route->memberships & destination_bit((int)d)) {
+                if (membership_has(&route->memberships, (int)d)) {
                     route->destination = (int)d;
                     break;
                 }

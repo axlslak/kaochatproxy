@@ -1,7 +1,7 @@
 # kaochatproxy
 
 A small C chat proxy for Anarchy Online and Nadybot. The executable is named
-**kworker**. It runs up to 32 worker characters, distributes buddy tracking,
+**kworker**. It runs up to 256 worker characters, distributes buddy tracking,
 and sends tells through independent per-worker queues. No SQL database is needed.
 
 The buddy, tell, and Nadybot proxy services are separate shared-library plugins.
@@ -40,7 +40,7 @@ chmod 600 kworker.conf
 ./kworker
 ```
 
-Repeat the following section for each worker character (maximum 32):
+Repeat the following section for each worker character (maximum 256):
 
 ```ini
 [worker]

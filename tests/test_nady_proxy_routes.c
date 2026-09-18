@@ -6,7 +6,8 @@
 
 static size_t test_workers = 3;
 static unsigned submit_calls;
-static uint64_t removed_on;
+static int allocation_last_worker_logged;
+static struct connection_memberships removed_on;
 
 static int mock_add(size_t index, uint32_t uid, const char *tag, size_t len)
 {
@@ -17,14 +18,16 @@ static int mock_add(size_t index, uint32_t uid, const char *tag, size_t len)
 static int mock_remove(size_t index, uint32_t uid)
 {
     (void)uid;
-    removed_on |= destination_bit((int)index);
+    membership_set(&removed_on, (int)index);
     return 1;
 }
 
 static void mock_log(void *context, enum kw_log_level level,
                      const char *plugin_name, const char *message)
 {
-    (void)context; (void)level; (void)plugin_name; (void)message;
+    (void)context; (void)level; (void)plugin_name;
+    if (strstr(message, "worker256="))
+        allocation_last_worker_logged = 1;
 }
 
 static size_t mock_worker_count(void *context)
@@ -37,7 +40,11 @@ static const char *mock_worker_name(void *context, size_t worker_index)
 {
     static const char *names[] = { "Workerone", "Workertwo", "Workerthree" };
     (void)context;
-    return worker_index < 3 ? names[worker_index] : NULL;
+    static char large_name[16];
+    if (worker_index < 3)
+        return names[worker_index];
+    snprintf(large_name, sizeof(large_name), "Worker%09u", (unsigned)(worker_index % 1000));
+    return large_name;
 }
 
 int main(void)
@@ -141,8 +148,67 @@ int main(void)
     put_u16(removal + 2, 4);
     put_u32(removal + 4, 30001);
     assert(handle_client_frame(removal, sizeof(removal), -1));
-    assert(removed_on == (destination_bit(2) | destination_bit(3)));
+    assert(membership_has(&removed_on, 2) && membership_has(&removed_on, 3));
+    for (int d = -1; d < (int)test_workers; ++d)
+        assert(membership_has(&removed_on, d) == (d == 2 || d == 3));
     assert(buddy_route_count == 0);
+    /* All workers, including every 64-bit boundary and the last worker. */
+    test_workers = KW_MAX_WORKERS;
+    for (size_t i = 0; i < test_workers; ++i)
+        worker_online[i] = 1;
+    assert(test_workers == 256);
+    assert(BUDDY_ROUTE_LIMIT == 257000);
+    observe_buddy(40001, -1, 0);
+    for (int d = 0; d < (int)test_workers; ++d) {
+        observe_buddy(40001, d, 0);
+        observe_buddy(40001, d, 0);
+        assert(worker_buddy_count[d] == 1);
+    }
+    assert(main_buddy_count == 1 && buddy_route_count == 1);
+    forget_leader_buddies();
+    assert(main_buddy_count == 0 && buddy_route_count == 1);
+    assert(!membership_has(&buddy_routes[0].memberships, -1));
+    memset(&removed_on, 0, sizeof(removed_on));
+    put_u32(removal + 4, 40001);
+    assert(handle_client_frame(removal, sizeof(removal), -1));
+    assert(!membership_has(&removed_on, -1));
+    for (int d = 0; d < (int)test_workers; ++d) {
+        assert(membership_has(&removed_on, d));
+        assert(worker_buddy_count[d] == 0);
+    }
+    assert(buddy_route_count == 0);
+
+    /* Reused route storage must not retain old high-word memberships. */
+    assert(assign_buddy_route(40002, 255, 1, &destination, &is_new));
+    assert(is_new && destination == 255 && worker_buddy_count[255] == 1);
+    for (int d = -1; d < 256; ++d)
+        assert(membership_has(&buddy_routes[0].memberships, d) == (d == 255));
+    observe_buddy(40002, 63, 0);
+    observe_buddy(40002, 255, 1);
+    assert(buddy_routes[0].destination == 63 && worker_buddy_count[255] == 0);
+    observe_buddy(40002, 63, 1);
+    assert(buddy_route_count == 0 && worker_buddy_count[63] == 0);
+    const char last_worker[] = "{\"mode\":\"by-worker\",\"worker\":256}";
+    assert(select_tell_destination(42, (const unsigned char *)last_worker,
+                                   strlen(last_worker)) == 255);
+    assert(!assign_buddy_route(40003, 256, 1, &destination, &is_new));
+
+    log_buddy_allocation(100);
+    assert(allocation_last_worker_logged);
+
+    /* A complete capability frame must include the final worker. */
+    assert(answer_capabilities());
+    assert(frame_head && frame_head == frame_tail);
+    assert(get_u16(frame_head->data) == AO_PING);
+    assert((size_t)get_u16(frame_head->data + 2) + 4 == frame_head->length);
+    assert((size_t)get_u16(frame_head->data + 4) + 6 == frame_head->length);
+    assert(contains_text(frame_head->data + 6, frame_head->length - 6,
+                         "Worker000000255"));
+    assert(contains_text(frame_head->data + 6, frame_head->length - 6,
+                         "\"buddy-modes\":[\"by-worker\"]}"));
+    free(frame_head->data);
+    free(frame_head);
+    frame_head = frame_tail = NULL;
     free(buddy_routes);
     return 0;
 }

@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #define KW_PLUGIN_ABI_V2 2u
-#define KW_MAX_WORKERS 32u
+#define KW_MAX_WORKERS 256u
 #define KW_PLUGIN_ENTRY_SYMBOL "kworker_plugin_v2"
 
 enum kw_log_level { KW_LOG_DEBUG, KW_LOG_INFO, KW_LOG_WARN, KW_LOG_ERROR };
