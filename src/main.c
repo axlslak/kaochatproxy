@@ -16,6 +16,10 @@
 volatile sig_atomic_t kw_stop_requested;
 volatile sig_atomic_t kw_reload_requested;
 
+/* Start connection attempts in small batches without blocking the AO loop. */
+#define KW_LOGIN_BATCH_SIZE 10u
+#define KW_LOGIN_BATCH_INTERVAL_SECONDS 1
+
 enum login_stage { WAIT_SEED, WAIT_CHARLIST, WAIT_LOGIN_OK, ONLINE };
 
 static const char *login_stage_name(enum login_stage stage)
@@ -338,6 +342,8 @@ static int run_workers(struct kw_runtime *runtime)
     aocConnection *connections[KW_MAX_WORKERS] = { 0 };
     struct sockaddr_in *address;
     time_t now;
+    size_t started_workers = 0;
+    struct timespec next_batch = { 0, 0 };
     size_t failed_worker = 0;
     const char *failure_reason = "unknown worker failure";
     int failure_packet = -1, failure_error = 0;
@@ -349,30 +355,54 @@ static int run_workers(struct kw_runtime *runtime)
         return 0;
     }
     aocSetPref(AOC_PREF_FASTRND, (void *)(intptr_t)1);
-    now = monotonic_seconds();
-    if (now == (time_t)-1) {
-        fputs("Cannot read monotonic clock.\n", stderr);
-        return 0;
-    }
-
-    for (size_t i = 0; i < runtime->config.worker_count; ++i) {
-        struct kw_worker_state *worker = &runtime->workers[i];
-        worker->stage = WAIT_SEED;
-        worker->login_deadline = (long)now + KW_LOGIN_TIMEOUT;
-        worker->next_ping = (long)now + KW_PING_INTERVAL;
-        connections[i] = aocInit(NULL);
-        worker->ao_connection = connections[i];
-        if (!connections[i] || !aocConnect(connections[i], address)) {
-            failed_worker = i;
-            failure_reason = "could not start AO connection";
+    while (!kw_stop_requested) {
+        aocEvent *event;
+        struct timespec batch_now;
+        if (clock_gettime(CLOCK_MONOTONIC, &batch_now) != 0) {
+            failure_reason = "monotonic clock failed";
             failure_error = errno;
             goto failed;
         }
-    }
-
-    while (!kw_stop_requested) {
-        aocEvent *event;
-        if (!aocPollArray(0, 250000, (int)runtime->config.worker_count,
+        if (started_workers < runtime->config.worker_count &&
+            (batch_now.tv_sec > next_batch.tv_sec ||
+             (batch_now.tv_sec == next_batch.tv_sec &&
+              batch_now.tv_nsec >= next_batch.tv_nsec))) {
+            size_t batch_first = started_workers;
+            size_t batch_end = started_workers + KW_LOGIN_BATCH_SIZE;
+            if (batch_end > runtime->config.worker_count)
+                batch_end = runtime->config.worker_count;
+            for (; started_workers < batch_end; ++started_workers) {
+                size_t i = started_workers;
+                struct kw_worker_state *worker = &runtime->workers[i];
+                now = monotonic_seconds();
+                if (now == (time_t)-1) {
+                    failed_worker = i;
+                    failure_reason = "monotonic clock failed";
+                    failure_error = errno;
+                    goto failed;
+                }
+                worker->stage = WAIT_SEED;
+                worker->login_deadline = (long)now + KW_LOGIN_TIMEOUT;
+                worker->next_ping = (long)now + KW_PING_INTERVAL;
+                connections[i] = aocInit(NULL);
+                worker->ao_connection = connections[i];
+                if (!connections[i] || !aocConnect(connections[i], address)) {
+                    failed_worker = i;
+                    failure_reason = "could not start AO connection";
+                    failure_error = errno;
+                    goto failed;
+                }
+            }
+            fprintf(stderr, "Starting Kworker connections %zu-%zu/%zu.\n",
+                    batch_first + 1, started_workers, runtime->config.worker_count);
+            if (clock_gettime(CLOCK_MONOTONIC, &next_batch) != 0) {
+                failure_reason = "monotonic clock failed";
+                failure_error = errno;
+                goto failed;
+            }
+            next_batch.tv_sec += KW_LOGIN_BATCH_INTERVAL_SECONDS;
+        }
+        if (!aocPollArray(0, 250000, (int)started_workers,
                           connections)) {
             if (errno == EINTR)
                 continue;
@@ -434,7 +464,7 @@ static int run_workers(struct kw_runtime *runtime)
             failure_error = errno;
             goto failed;
         }
-        for (size_t i = 0; i < runtime->config.worker_count; ++i) {
+        for (size_t i = 0; i < started_workers; ++i) {
             struct kw_worker_state *worker = &runtime->workers[i];
             if (worker->stage != ONLINE && (long)now >= worker->login_deadline) {
                 failed_worker = i;
