@@ -63,6 +63,47 @@ For distributing paged tells in Nadybot, enable `force_mass_tells`; disable
 different workers can arrive out of order. Each worker's tell queue is paced
 independently at one tell per second.
 
+## Worker service for City Dwellers
+
+To let a service use the already logged-in workers without its own AO login,
+start the updated host and plugins in worker mode:
+
+```sh
+KWORKER_PROXY_MODE=workers ./kworker
+```
+
+The listener uses the same LAN address and port 9993. All AO usernames,
+passwords and character names stay in `kworker.conf`. The service connection
+does not create or authenticate a leader. Names are resolved through online
+workers, and buddy assignments use only worker capacity. The default `leader`
+mode retains the existing Nadybot login relay.
+
+City Dwellers configuration, inside the existing `Manager` object:
+
+```json
+"ChatProxy": {
+    "Enabled": true,
+    "Host": "192.168.23.38",
+    "Port": 9993
+}
+```
+
+Manager is the sole client; other City Dwellers components use Manager memory.
+Existing City Dwellers tell delivery is unaffected. Rebuild the kworker host
+and all plugins together for the added worker lookup API; reloading just the
+plugin into an older host is insufficient. This mode also serves one client
+at a time, so a separate Nadybot client cannot share this listener concurrently.
+
+Worker mode uses the existing big-endian AO chat frame envelope. On connect it
+sends packet 100 containing an AO string of capabilities JSON, including
+`"connection-mode":"workers"`. Packet 100 `capabilities` requests return the
+same description; other valid ping strings are echoed. Client packet 21 is an
+AO string name; server packet 21 is UID32 plus an AO string name, obtained from
+the workers' AO replies. Buddy add/remove/status and worker tags retain their
+existing packet formats. Unsupported packets close the service connection;
+no fallback leader login is attempted. A disconnect never means a tracked
+player went offline; clients must resubscribe and await fresh buddy reports.
+
 ## Environment settings
 
 | Variable | Default / purpose |
@@ -72,13 +113,14 @@ independently at one tell per second.
 | `AOSERVER`, `AOPORT` | Worker chat server: `chat.d1.funcom.com`, `7105` |
 | `NADY_LISTEN_HOST` | An active `192.168.0.0/16` interface; otherwise `127.0.0.1` |
 | `NADY_PORT` | Proxy listener port: `9993` |
+| `KWORKER_PROXY_MODE` | `leader` for Nadybot; `workers` for a service using existing worker logins |
 | `NADY_UPSTREAM_HOST`, `NADY_UPSTREAM_PORT` | Leader chat server: `chat.d1.funcom.com`, `7105` |
 | `KWORKER_PLUGIN_DIR` | `./kworker-plugins` |
 
 Set `NADY_LISTEN_HOST` explicitly when the machine has multiple LAN interfaces.
 Use the listener only on a trusted network and restrict access with a firewall:
-it forwards the client's AO login exchange and does not add TLS or a separate
-proxy authentication layer.
+leader mode forwards the client's AO login exchange. Neither mode adds TLS or
+a separate proxy authentication layer.
 
 ## Behavior and limits
 

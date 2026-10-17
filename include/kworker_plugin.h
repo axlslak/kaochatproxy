@@ -47,6 +47,8 @@ struct kw_host_v2 {
     const char *(*worker_name)(void *context, size_t worker_index);
     uint32_t (*worker_uid)(void *context, size_t worker_index);
     int (*worker_online)(void *context, size_t worker_index);
+    /* AO-owner thread only, like the other ao_* functions. */
+    int (*ao_name_lookup)(void *context, size_t worker_index, const char *name);
 };
 
 struct kw_plugin_v2 {

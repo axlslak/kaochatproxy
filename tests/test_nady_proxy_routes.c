@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <stddef.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "../plugins/nady_proxy.c"
 
@@ -8,6 +9,16 @@ static size_t test_workers = 3;
 static unsigned submit_calls;
 static int allocation_last_worker_logged;
 static struct connection_memberships removed_on;
+static unsigned lookup_calls;
+
+static int mock_lookup(void *context, size_t index, const char *name)
+{
+    (void)context;
+    assert(index < test_workers && worker_online[index]);
+    assert(strcmp(name, "Kavey") == 0);
+    lookup_calls++;
+    return 1;
+}
 
 static int mock_add(size_t index, uint32_t uid, const char *tag, size_t len)
 {
@@ -47,6 +58,74 @@ static const char *mock_worker_name(void *context, size_t worker_index)
     return large_name;
 }
 
+static void test_worker_service(void)
+{
+    int sockets[2], destination, is_new;
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    struct timeval timeout = { 1, 0 };
+    assert(setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+    worker_only = 1;
+    main_online = 0;
+    client_fd = sockets[0];
+    test_workers = 3;
+
+    /* Capabilities are available without any AO leader or LoginOK. */
+    assert(answer_capabilities() && drain_frames(sockets[0]));
+    size_t length;
+    unsigned char *frame = recv_frame(sockets[1], &length);
+    assert(frame && get_u16(frame) == AO_PING);
+    assert(contains_text(frame + 6, length - 6, "\"connection-mode\":\"workers\""));
+    free(frame);
+
+    /* No request can reserve a slot on the nonexistent leader. */
+    assert(!assign_buddy_route(50000, -1, 1, &destination, &is_new));
+    for (uint32_t uid = 50001; uid < 50007; ++uid) {
+        assert(assign_buddy_route(uid, -1, 0, &destination, &is_new));
+        assert(is_new && destination >= 0 && destination < 3);
+    }
+    assert(main_buddy_count == 0);
+    for (size_t i = 0; i < test_workers; ++i)
+        assert(worker_buddy_count[i] == 2);
+    while (buddy_route_count)
+        assert(take_buddy_route(buddy_routes[0].uid, &destination));
+
+    /* Socket ingestion queues a lookup; only the AO-owner tick sends it. */
+    const unsigned char name[] = { 0, 5, 'K', 'a', 'v', 'e', 'y' };
+    frame = make_frame(AO_LOOKUP_RESULT, name, sizeof(name), &length);
+    assert(frame && handle_client_frame(frame, length, -1));
+    free(frame);
+    assert(lookup_calls == 0 && lookup_count == 1);
+    on_tick();
+    assert(lookup_calls == 1 && lookup_count == 0);
+    const struct kw_ao_event result = { KW_AO_LOOKUP_RESULT, 0, 1234, 0, "Kavey", 5 };
+    on_event(&result);
+    assert(drain_frames(sockets[0]));
+    frame = recv_frame(sockets[1], &length);
+    assert(frame && get_u16(frame) == AO_LOOKUP_RESULT && get_u32(frame + 4) == 1234);
+    assert(length == 15 && memcmp(frame + 10, "Kavey", 5) == 0);
+    free(frame);
+
+    /* Heartbeats are answered locally, never forwarded to a leader. */
+    frame = make_frame(AO_PING, name, sizeof(name), &length);
+    assert(frame && handle_client_frame(frame, length, -1) && drain_frames(sockets[0]));
+    free(frame);
+    frame = recv_frame(sockets[1], &length);
+    assert(frame && get_u16(frame) == AO_PING && length == 11);
+    assert(memcmp(frame + 4, name, sizeof(name)) == 0);
+    free(frame);
+
+    /* Reconnect cleanup discards unsent work; disconnected events don't grow RAM. */
+    assert(queue_lookup(name + 2, 5));
+    clear_client_queues();
+    assert(!lookup_head && !lookup_tail && lookup_count == 0);
+    client_fd = -1;
+    on_event(&result);
+    assert(!frame_head && !frame_tail);
+    worker_only = 0;
+    close(sockets[0]);
+    close(sockets[1]);
+}
+
 int main(void)
 {
     static const struct kw_host_v2 mock_host = {
@@ -54,7 +133,8 @@ int main(void)
         .struct_size = sizeof(struct kw_host_v2),
         .worker_count = mock_worker_count,
         .log = mock_log,
-        .worker_name = mock_worker_name
+        .worker_name = mock_worker_name,
+        .ao_name_lookup = mock_lookup
     };
     int destination, is_new;
 
@@ -209,6 +289,7 @@ int main(void)
     free(frame_head->data);
     free(frame_head);
     frame_head = frame_tail = NULL;
+    test_worker_service();
     free(buddy_routes);
     return 0;
 }

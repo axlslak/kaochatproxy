@@ -171,6 +171,17 @@ static int host_tell(void *context, size_t worker_index, uint32_t uid,
                                  tag, 1) > 0;
 }
 
+static int host_name_lookup(void *context, size_t worker_index, const char *name)
+{
+    struct kw_runtime *runtime = context;
+    if (worker_index >= runtime->config.worker_count || !name || !*name ||
+        strlen(name) > AOC_MAX_NAME_LEN)
+        return 0;
+    struct kw_worker_state *worker = &runtime->workers[worker_index];
+    return worker->online && worker->ao_connection &&
+           aocSendNameLookup(worker->ao_connection, name) > 0;
+}
+
 static size_t host_worker_count(void *context)
 {
     return ((struct kw_runtime *)context)->config.worker_count;
@@ -514,7 +525,8 @@ int main(void)
         .worker_count = host_worker_count,
         .worker_name = host_worker_name,
         .worker_uid = host_worker_uid,
-        .worker_online = host_worker_online
+        .worker_online = host_worker_online,
+        .ao_name_lookup = host_name_lookup
     };
 
     if (!kw_plugins_load(&runtime))

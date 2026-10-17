@@ -25,8 +25,8 @@ assert 'getenv("AOUSER")' in config
 assert "next_send[KW_MAX_WORKERS]" in tell
 assert "for (size_t worker_index = 0; worker_index < count; ++worker_index)" in tell
 assert "pthread_join" in nady
-assert "if (!main_online)" in nady
-assert nady.index("if (!main_online)") < nady.index("node = frame_head", nady.index("static int drain_frames"))
+assert "if (!main_online && !worker_only)" in nady
+assert nady.index("if (!main_online && !worker_only)") < nady.index("node = frame_head", nady.index("static int drain_frames"))
 assert "Nadybot client socket closed" in nady
 assert "Funcom leader socket closed" in nady
 assert "select_private_ipv4" in nady

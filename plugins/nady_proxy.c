@@ -80,6 +80,11 @@ struct frame_node {
     struct frame_node *next;
 };
 
+struct lookup_node {
+    char name[16];
+    struct lookup_node *next;
+};
+
 static const struct kw_host_v2 *host;
 static const struct kw_buddy_service_v2 *buddy;
 static const struct kw_tell_service_v2 *tell;
@@ -90,7 +95,10 @@ static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
 static int listener_fd = -1, client_fd = -1, upstream_fd = -1;
 static int worker_online[KW_MAX_WORKERS], worker_announced[KW_MAX_WORKERS];
 static int main_online;
+static int worker_only;
 static struct frame_node *frame_head, *frame_tail;
+static struct lookup_node *lookup_head, *lookup_tail;
+static size_t lookup_count, lookup_round_robin;
 static struct buddy_route *buddy_routes;
 static size_t buddy_route_capacity;
 static size_t buddy_route_count, main_buddy_count;
@@ -98,6 +106,7 @@ static size_t worker_buddy_count[KW_MAX_WORKERS];
 static size_t tell_round_robin;
 static time_t started_at;
 static atomic_int route_failed;
+static atomic_int lookup_failed;
 static void observe_buddy(uint32_t uid, int destination, int removed);
 
 static uint16_t get_u16(const unsigned char *value)
@@ -169,6 +178,12 @@ static int queue_frame(unsigned char *frame, size_t length)
     node->length = length;
     node->next = NULL;
     pthread_mutex_lock(&state_lock);
+    if (worker_only && client_fd < 0) {
+        pthread_mutex_unlock(&state_lock);
+        free(node->data);
+        free(node);
+        return 1;
+    }
     if (frame_tail)
         frame_tail->next = node;
     else
@@ -414,10 +429,11 @@ static int answer_capabilities(void)
     size_t json_len = 0, frame_len;
     unsigned char *frame;
     int length = snprintf(json, sizeof(json),
-        "{\"name\":\"kworker-nady-proxy\",\"version\":\"0.1.0\","
+        "{\"name\":\"kworker-nady-proxy\",\"version\":\"0.2.0\","
+        "\"connection-mode\":\"%s\","
         "\"type\":\"capabilities\",\"supported-cmds\":[\"capabilities\"],"
         "\"rate-limited\":true,\"default-mode\":\"round-robin\","
-        "\"workers\":[");
+        "\"workers\":[", worker_only ? "workers" : "leader");
     if (length < 0 || (size_t)length >= sizeof(json))
         return 0;
     json_len = (size_t)length;
@@ -510,8 +526,8 @@ static int forced_destination(const unsigned char *tag, size_t tag_len,
 
 static int least_loaded_destination(void)
 {
-    int destination = main_buddy_count < 1000 ? -1 : -2;
-    size_t least = main_buddy_count < 1000 ? main_buddy_count : 999;
+    int destination = !worker_only && main_buddy_count < 1000 ? -1 : -2;
+    size_t least = !worker_only && main_buddy_count < 1000 ? main_buddy_count : 999;
     size_t count = host->worker_count(host->context);
     for (size_t i = 0; i < count; ++i) {
         if (!worker_online[i])
@@ -641,6 +657,7 @@ static int assign_buddy_route(uint32_t uid, int requested_destination,
     *destination = has_forced_destination ?
         requested_destination : least_loaded_destination();
     if (*destination < -1 || *destination >= (int)host->worker_count(host->context) ||
+        (worker_only && *destination == -1) ||
         (*destination < 0 ? main_buddy_count : worker_buddy_count[*destination]) >= 1000) {
         pthread_mutex_unlock(&state_lock);
         host->log(host->context, KW_LOG_ERROR, "nady_proxy",
@@ -784,6 +801,88 @@ static int submit_buddy(size_t index, uint32_t uid, int remove)
     return 0;
 }
 
+/* Only the AO owner calls libaochat. The socket thread submits names here. */
+static int queue_lookup(const unsigned char *name, size_t length)
+{
+    if (!length || length > 15 || memchr(name, 0, length))
+        return 0;
+    struct lookup_node *node = calloc(1, sizeof(*node));
+    if (!node)
+        return 0;
+    memcpy(node->name, name, length);
+    pthread_mutex_lock(&state_lock);
+    if (lookup_count == BUDDY_ROUTE_LIMIT) {
+        pthread_mutex_unlock(&state_lock);
+        free(node);
+        return 0;
+    }
+    if (lookup_tail)
+        lookup_tail->next = node;
+    else
+        lookup_head = node;
+    lookup_tail = node;
+    lookup_count++;
+    pthread_mutex_unlock(&state_lock);
+    return 1;
+}
+
+static void on_tick(void)
+{
+    if (!worker_only)
+        return;
+    /* At most one dispatch per online worker per tick; no sleeps on the
+     * AO owner. Replies use the existing KW_AO_LOOKUP_RESULT event. */
+    size_t count = host->worker_count(host->context);
+    size_t start = lookup_round_robin++;
+    for (size_t i = 0; i < count; ++i) {
+        size_t destination = (start + i) % count;
+        pthread_mutex_lock(&state_lock);
+        if (!worker_online[destination]) {
+            pthread_mutex_unlock(&state_lock);
+            continue;
+        }
+        struct lookup_node *node = lookup_head;
+        if (node) {
+            lookup_head = node->next;
+            if (!lookup_head)
+                lookup_tail = NULL;
+            lookup_count--;
+        }
+        pthread_mutex_unlock(&state_lock);
+        if (!node)
+            return;
+        int ok = host->ao_name_lookup(host->context, destination, node->name);
+        free(node);
+        if (!ok) {
+            host->log(host->context, KW_LOG_WARN, "nady_proxy", "worker name lookup could not be sent");
+            atomic_store(&lookup_failed, 1);
+            return;
+        }
+    }
+}
+
+static void clear_client_queues(void)
+{
+    pthread_mutex_lock(&state_lock);
+    struct frame_node *frame = frame_head;
+    struct lookup_node *lookup = lookup_head;
+    frame_head = frame_tail = NULL;
+    lookup_head = lookup_tail = NULL;
+    lookup_count = 0;
+    pthread_mutex_unlock(&state_lock);
+    while (frame) {
+        struct frame_node *next = frame->next;
+        free(frame->data);
+        free(frame);
+        frame = next;
+    }
+    while (lookup) {
+        struct lookup_node *next = lookup->next;
+        free(lookup);
+        lookup = next;
+    }
+}
+
 static int handle_client_frame(const unsigned char *frame, size_t frame_len, int upstream)
 {
     uint16_t type = get_u16(frame), body_len = get_u16(frame + 2);
@@ -792,6 +891,11 @@ static int handle_client_frame(const unsigned char *frame, size_t frame_len, int
     uint32_t uid;
     if ((size_t)body_len + 4 != frame_len)
         return 0;
+    if (worker_only && type == AO_LOOKUP_RESULT) {
+        position = 0;
+        return parse_string(body, body_len, &position, &first, &first_len) &&
+            position == body_len && queue_lookup(first, first_len);
+    }
     if (type == AO_BUDDY_ADD) {
         int destination = -1, is_new, forced;
         if (body_len < 6)
@@ -830,14 +934,14 @@ static int handle_client_frame(const unsigned char *frame, size_t frame_len, int
             for (size_t i = 0; i < host->worker_count(host->context); ++i)
                 if (!submit_buddy(i, uid, 1))
                     worker_ok = 0;
-            int main_ok = send_all(upstream, frame, frame_len);
+            int main_ok = worker_only || send_all(upstream, frame, frame_len);
             return worker_ok && main_ok;
         }
         int ok = 1;
         for (size_t i = 0; i < host->worker_count(host->context); ++i)
             if (membership_has(&memberships, (int)i) && !submit_buddy(i, uid, 1))
                 ok = 0;
-        if (membership_has(&memberships, -1) && !send_all(upstream, frame, frame_len))
+        if (!worker_only && membership_has(&memberships, -1) && !send_all(upstream, frame, frame_len))
             ok = 0;
         return ok;
     }
@@ -850,6 +954,13 @@ static int handle_client_frame(const unsigned char *frame, size_t frame_len, int
             !parse_string(body, body_len, &position, &second, &second_len) ||
             position != body_len)
             return 0;
+        if (worker_only) {
+            int destination = second_len && second[0] ?
+                select_tell_destination(uid, second, second_len) :
+                online_worker_from(tell_round_robin++);
+            return destination >= 0 && tell->enqueue((size_t)destination, uid,
+                                                    (const char *)first, first_len);
+        }
         if (second_len && second[0] != 0) {
             int destination = select_tell_destination(uid, second, second_len);
             if (destination == -2)
@@ -862,10 +973,20 @@ static int handle_client_frame(const unsigned char *frame, size_t frame_len, int
     }
     if (type == AO_PING) {
         position = 0;
-        if (parse_string(body, body_len, &position, &first, &first_len) &&
-            position == body_len && is_capabilities(first, first_len))
+        int valid = parse_string(body, body_len, &position, &first, &first_len) &&
+            position == body_len;
+        if (valid && is_capabilities(first, first_len))
             return answer_capabilities();
+        if (worker_only) {
+            if (!valid)
+                return 0;
+            size_t length;
+            unsigned char *reply = make_frame(type, body, body_len, &length);
+            return reply && queue_frame(reply, length);
+        }
     }
+    if (worker_only)
+        return 0; /* No leader socket or account exists in this mode. */
     return send_all(upstream, frame, frame_len);
 }
 
@@ -879,7 +1000,7 @@ static int drain_frames(int client)
          * any of them on the leader stream until Funcom has completed that
          * stream's login handshake.
          */
-        if (!main_online) {
+        if (!main_online && !worker_only) {
             pthread_mutex_unlock(&state_lock);
             return 1;
         }
@@ -1003,6 +1124,41 @@ static int proxy_session(int client, int upstream)
     return 1;
 }
 
+static int worker_session(int client)
+{
+    clear_client_queues();
+    atomic_store(&lookup_failed, 0);
+    if (!answer_capabilities())
+        return 0;
+    while (!atomic_load(&stop_requested)) {
+        if (atomic_load(&route_failed) || atomic_load(&lookup_failed) || !drain_frames(client))
+            return 0;
+        struct pollfd fd = { client, POLLIN, 0 };
+        int ready = poll(&fd, 1, 250);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            return 0;
+        }
+        if (fd.revents & (POLLERR | POLLHUP | POLLNVAL))
+            return 0;
+        if (fd.revents & POLLIN) {
+            size_t length;
+            unsigned char *frame = recv_frame(client, &length);
+            if (!frame)
+                return 0;
+            int ok = handle_client_frame(frame, length, -1);
+            free(frame);
+            if (!ok) {
+                host->log(host->context, KW_LOG_WARN, "nady_proxy",
+                          "worker-service packet was invalid or could not be routed");
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 static void publish_socket(int *slot, int value)
 {
     pthread_mutex_lock(&state_lock);
@@ -1063,8 +1219,8 @@ static void *thread_main(void *unused)
     }
     publish_socket(&listener_fd, listener);
     snprintf(log_message, sizeof(log_message),
-             "listener ready on %s:%s (%s)",
-             listen_host, listen_port, listen_source);
+             "listener ready on %s:%s (%s; %s mode)",
+             listen_host, listen_port, listen_source, worker_only ? "workers" : "leader");
     host->log(host->context, KW_LOG_INFO, "nady_proxy", log_message);
     while (!atomic_load(&stop_requested)) {
         int client = accept(listener, NULL, NULL);
@@ -1074,13 +1230,20 @@ static void *thread_main(void *unused)
             break;
         }
         publish_socket(&client_fd, client);
-        int upstream = connect_tcp(upstream_host, upstream_port);
-        if (upstream >= 0) {
-            publish_socket(&upstream_fd, upstream);
-            proxy_session(client, upstream);
-            forget_leader_buddies();
-            close(upstream);
-            publish_socket(&upstream_fd, -1);
+        if (worker_only) {
+            host->log(host->context, KW_LOG_INFO, "nady_proxy", "worker-service client connected");
+            worker_session(client);
+            clear_client_queues();
+            host->log(host->context, KW_LOG_INFO, "nady_proxy", "worker-service client disconnected");
+        } else {
+            int upstream = connect_tcp(upstream_host, upstream_port);
+            if (upstream >= 0) {
+                publish_socket(&upstream_fd, upstream);
+                proxy_session(client, upstream);
+                forget_leader_buddies();
+                close(upstream);
+                publish_socket(&upstream_fd, -1);
+            }
         }
         close(client);
         publish_socket(&client_fd, -1);
@@ -1096,6 +1259,14 @@ static int plugin_init(const struct kw_host_v2 *host_api)
         host_api->struct_size < sizeof(*host_api))
         return 0;
     host = host_api;
+    const char *mode = getenv("KWORKER_PROXY_MODE");
+    worker_only = mode && strcmp(mode, "workers") == 0;
+    if ((mode && *mode && !worker_only && strcmp(mode, "leader") != 0) ||
+        (worker_only && !host->ao_name_lookup)) {
+        host->log(host->context, KW_LOG_ERROR, "nady_proxy",
+                  "KWORKER_PROXY_MODE must be leader or workers; workers requires the updated host");
+        return 0;
+    }
     buddy = host->find_service(host->context, KW_BUDDY_SERVICE, KW_SERVICE_V2);
     tell = host->find_service(host->context, KW_TELL_SERVICE, KW_SERVICE_V2);
     if (!buddy || !tell)
@@ -1172,28 +1343,22 @@ static void plugin_stop(void)
 
 static void plugin_destroy(void)
 {
-    struct frame_node *node;
     buddy->set_sink(NULL, NULL);
     tell->set_sink(NULL, NULL);
+    clear_client_queues();
     pthread_mutex_lock(&state_lock);
-    node = frame_head;
-    frame_head = frame_tail = NULL;
     buddy_route_count = main_buddy_count = tell_round_robin = 0;
     free(buddy_routes);
     buddy_routes = NULL;
     buddy_route_capacity = 0;
     atomic_store(&route_failed, 0);
+    atomic_store(&lookup_failed, 0);
+    lookup_round_robin = 0;
     memset(worker_buddy_count, 0, sizeof(worker_buddy_count));
     memset(worker_online, 0, sizeof(worker_online));
     memset(worker_announced, 0, sizeof(worker_announced));
     main_online = 0;
     pthread_mutex_unlock(&state_lock);
-    while (node) {
-        struct frame_node *next = node->next;
-        free(node->data);
-        free(node);
-        node = next;
-    }
     buddy = NULL;
     tell = NULL;
     host = NULL;
@@ -1201,7 +1366,7 @@ static void plugin_destroy(void)
 
 static const struct kw_plugin_v2 plugin = {
     KW_PLUGIN_ABI_V2, sizeof(struct kw_plugin_v2), "nady_proxy", 30,
-    plugin_init, plugin_start, on_event, NULL, plugin_stop, plugin_destroy
+    plugin_init, plugin_start, on_event, on_tick, plugin_stop, plugin_destroy
 };
 
 const struct kw_plugin_v2 *kworker_plugin_v2(void)
